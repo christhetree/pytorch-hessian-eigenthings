@@ -2,7 +2,7 @@
 This module contains functions to perform power iteration with deflation
 to compute the top eigenvalues and eigenvectors of a linear operator
 """
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -93,7 +93,7 @@ def power_iteration(
     momentum: float = 0.0,
     use_gpu: bool = True,
     fp16: bool = False,
-    init_vec: torch.Tensor = None,
+    init_vec: Optional[torch.Tensor] = None,
     return_rel_residual: bool = False,
 ) -> Union[Tuple[float, torch.Tensor], Tuple[float, torch.Tensor, float]]:
     """
@@ -106,6 +106,8 @@ def power_iteration(
     returns: (principal eigenvalue, principal eigenvector) pair, and optionally
         the relative residual
     """
+    if steps < 1:
+        raise ValueError(f"steps must be >= 1, got {steps}")
     vector_size = operator.size  # input dimension of operator
     if init_vec is None:
         vec = torch.rand(vector_size)
@@ -119,7 +121,6 @@ def power_iteration(
 
     prev_lambda = 0.0
     rel_residual = 1.0
-    prev_vec = utils.maybe_fp16(torch.randn_like(vec), fp16)
     for i in range(steps):
         prev_vec = vec / (torch.linalg.vector_norm(vec) + 1e-6)
         new_vec = utils.maybe_fp16(operator.apply(vec), fp16) - momentum * prev_vec
@@ -130,20 +131,24 @@ def power_iteration(
             if return_rel_residual:
                 return 0.0, new_vec, 0.0
             return 0.0, new_vec
-        lambda_estimate = vec.dot(new_vec).item()
+        lambda_estimate = prev_vec.dot(new_vec)
         # Relative residual of the unit vector the operator was applied to
-        residual = new_vec - prev_vec.dot(new_vec) * prev_vec
-        rel_residual = (torch.linalg.vector_norm(residual) / new_vec_norm).item()
+        residual = new_vec - lambda_estimate * prev_vec
+        rel_residual = torch.linalg.vector_norm(residual) / new_vec_norm
         diff = lambda_estimate - prev_lambda
         vec = new_vec.detach() / new_vec_norm
-        if lambda_estimate == 0.0:  # for low-rank
-            error = 1.0
-        else:
-            error = np.abs(diff / lambda_estimate)
+        # error is 1.0 when lambda_estimate == 0.0 (for low-rank)
+        error = torch.where(
+            lambda_estimate == 0.0,
+            torch.ones_like(lambda_estimate),
+            torch.abs(diff / lambda_estimate),
+        )
+        error = float(error)
         utils.progress_bar(i, steps, "power iter error: %.4f" % error)
         if error < error_threshold:
             break
         prev_lambda = lambda_estimate
+    lambda_estimate = float(lambda_estimate)
     if return_rel_residual:
-        return lambda_estimate, vec, rel_residual
+        return lambda_estimate, vec, float(rel_residual)
     return lambda_estimate, vec
