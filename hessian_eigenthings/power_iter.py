@@ -2,7 +2,7 @@
 This module contains functions to perform power iteration with deflation
 to compute the top eigenvalues and eigenvectors of a linear operator
 """
-from typing import Tuple
+from typing import Tuple, Union
 
 import numpy as np
 import torch
@@ -20,17 +20,22 @@ def deflated_power_iteration(
     use_gpu: bool = True,
     fp16: bool = False,
     to_numpy: bool = True,
-) -> Tuple[np.ndarray, np.ndarray]:
+    return_rel_residuals: bool = False,
+) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
     Compute top k eigenvalues by repeatedly subtracting out dyads
     operator: linear operator that gives us access to matrix vector product
     num_eigenvals number of eigenvalues to compute
     power_iter_steps: number of steps per run of power iteration
     power_iter_err_threshold: early stopping threshold for power iteration
-    returns: np.ndarray of top eigenvalues, np.ndarray of top eigenvectors
+    return_rel_residuals: if True, also return the final relative residual
+        ||Av - lambda v|| / ||Av|| of each eigenpair
+    returns: np.ndarray of top eigenvalues, np.ndarray of top eigenvectors, and
+        optionally np.ndarray of relative residuals
     """
     eigenvals = []
     eigenvecs = []
+    rel_residuals = []
     current_op = operator
     prev_vec = None
 
@@ -40,7 +45,7 @@ def deflated_power_iteration(
     utils.log("beginning deflated power iteration")
     for i in range(num_eigenthings):
         utils.log("computing eigenvalue/vector %d of %d" % (i + 1, num_eigenthings))
-        eigenval, eigenvec = power_iteration(
+        eigenval, eigenvec, rel_residual = power_iteration(
             current_op,
             power_iter_steps,
             power_iter_err_threshold,
@@ -48,6 +53,7 @@ def deflated_power_iteration(
             use_gpu=use_gpu,
             fp16=fp16,
             init_vec=prev_vec,
+            return_rel_residual=True,
         )
         utils.log("eigenvalue %d: %.4f" % (i + 1, eigenval))
 
@@ -57,6 +63,7 @@ def deflated_power_iteration(
         current_op = LambdaOperator(_new_op_fn, operator.size)
         prev_vec = eigenvec
         eigenvals.append(eigenval)
+        rel_residuals.append(rel_residual)
         eigenvec = eigenvec.cpu()
         if to_numpy:
             # Clone so that power_iteration can continue to use torch.
@@ -67,11 +74,15 @@ def deflated_power_iteration(
 
     eigenvals = np.array(eigenvals)
     eigenvecs = np.array(eigenvecs)
+    rel_residuals = np.array(rel_residuals)
 
     # sort them in descending order
     sorted_inds = np.argsort(eigenvals)
     eigenvals = eigenvals[sorted_inds][::-1]
     eigenvecs = eigenvecs[sorted_inds][::-1]
+    rel_residuals = rel_residuals[sorted_inds][::-1]
+    if return_rel_residuals:
+        return eigenvals, eigenvecs, rel_residuals
     return eigenvals, eigenvecs
 
 
@@ -83,12 +94,17 @@ def power_iteration(
     use_gpu: bool = True,
     fp16: bool = False,
     init_vec: torch.Tensor = None,
-) -> Tuple[float, torch.Tensor]:
+    return_rel_residual: bool = False,
+) -> Union[Tuple[float, torch.Tensor], Tuple[float, torch.Tensor, float]]:
     """
     Compute dominant eigenvalue/eigenvector of a matrix
     operator: linear Operator giving us matrix-vector product access
     steps: number of update steps to take
-    returns: (principal eigenvalue, principal eigenvector) pair
+    return_rel_residual: if True, also return the relative residual
+        ||Av - lambda v|| / ||Av|| of the final step, where v is the unit vector
+        the operator was applied to and lambda = v . Av
+    returns: (principal eigenvalue, principal eigenvector) pair, and optionally
+        the relative residual
     """
     vector_size = operator.size  # input dimension of operator
     if init_vec is None:
@@ -102,17 +118,24 @@ def power_iteration(
         vec = vec.cuda()
 
     prev_lambda = 0.0
+    rel_residual = 1.0
     prev_vec = utils.maybe_fp16(torch.randn_like(vec), fp16)
     for i in range(steps):
-        prev_vec = vec / (torch.norm(vec) + 1e-6)
+        prev_vec = vec / (torch.linalg.vector_norm(vec) + 1e-6)
         new_vec = utils.maybe_fp16(operator.apply(vec), fp16) - momentum * prev_vec
+        new_vec_norm = torch.linalg.vector_norm(new_vec)
         # need to handle case where we end up in the nullspace of the operator.
         # in this case, we are done.
-        if torch.norm(new_vec).item() == 0.0:
+        if new_vec_norm.item() == 0.0:
+            if return_rel_residual:
+                return 0.0, new_vec, 0.0
             return 0.0, new_vec
         lambda_estimate = vec.dot(new_vec).item()
+        # Relative residual of the unit vector the operator was applied to
+        residual = new_vec - prev_vec.dot(new_vec) * prev_vec
+        rel_residual = (torch.linalg.vector_norm(residual) / new_vec_norm).item()
         diff = lambda_estimate - prev_lambda
-        vec = new_vec.detach() / torch.norm(new_vec)
+        vec = new_vec.detach() / new_vec_norm
         if lambda_estimate == 0.0:  # for low-rank
             error = 1.0
         else:
@@ -121,4 +144,6 @@ def power_iteration(
         if error < error_threshold:
             break
         prev_lambda = lambda_estimate
+    if return_rel_residual:
+        return lambda_estimate, vec, rel_residual
     return lambda_estimate, vec
